@@ -1,9 +1,9 @@
-name: Scrape Climate Active certified brands
+name: Scrape Climate Active Certified Brands
 
 on:
   schedule:
-    - cron: "0 6 * * 1"
-  workflow_dispatch:
+    - cron: "0 0 * * 1" # Every Monday at midnight UTC
+  workflow_dispatch: # Allow manual runs
 
 permissions:
   contents: write
@@ -11,40 +11,33 @@ permissions:
 jobs:
   scrape:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 30
+
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-          cache: pip
 
       - name: Install dependencies
         run: |
-          python -m pip install --upgrade pip
           pip install -r requirements.txt
-
-      - name: Install Playwright Chromium
-        run: python -m playwright install --with-deps chromium
+          playwright install --with-deps chromium
 
       - name: Run scraper
-        run: python scrape.py --output certified_brands.csv
+        run: python scrape.py
 
-      - name: Upload CSV as workflow artifact
+      - name: Upload CSV as artifact
         uses: actions/upload-artifact@v4
         with:
-          name: certified_brands
-          path: certified_brands.csv
+          name: companies
+          path: companies.csv
 
       - name: Commit updated CSV
         run: |
-          if [[ -n "$(git status --porcelain certified_brands.csv)" ]]; then
-            git config user.name "github-actions[bot]"
-            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git add certified_brands.csv
-            git commit -m "chore: update certified brands CSV"
-            git push
-          else
-            echo "No CSV changes to commit."
-          fi
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add companies.csv
+          git diff --cached --quiet || git commit -m "Update certified companies list"
+          git push
