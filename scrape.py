@@ -39,6 +39,11 @@ SOCIAL_MEDIA_DOMAINS = [
 
 BRAND_PATH_RE = re.compile(r"^/buy-climate-active/certified-members/[^/?#]+/?$")
 
+# Labels the original Playwright scraper looked for on "Load more" buttons.
+# We match the same strings on anchor text as a fallback for sites that ship a
+# JS-disabled link alongside the button.
+LOAD_MORE_LABELS = ("Load more", "Show more", "See more", "View more")
+
 
 def _log(msg):
     print(msg, flush=True)
@@ -114,17 +119,35 @@ def _extract_brand_paths(soup):
 
 
 def _find_next_url(soup, current_url):
-    """Find the next page URL using Drupal-style rel=next pager links."""
+    """Find the URL of the next batch of brands.
+
+    Tries, in order: rel=next pager links, the Drupal pager next link, and
+    any anchor whose visible text matches a "Load more"-style label. The
+    original Playwright scraper advanced by clicking buttons with those
+    labels; here we follow whichever URL the equivalent anchor exposes.
+    """
     link = soup.find("a", attrs={"rel": "next"})
     if not link:
         link = soup.select_one("li.pager__item--next a")
+    if not link:
+        for a in soup.find_all("a", href=True):
+            text = a.get_text(" ", strip=True).lower()
+            if text and any(label.lower() in text for label in LOAD_MORE_LABELS):
+                link = a
+                break
     if not link or not link.get("href"):
         return None
     return urljoin(current_url, link["href"])
 
 
 def collect_brand_urls(session):
-    """Walk the directory pager and collect every brand URL."""
+    """Walk the directory and collect every brand URL.
+
+    Mirrors the original Playwright loop: keep advancing to the next batch
+    until either no next-page link can be found or the total brand count
+    stops growing (the count-plateau termination from the JS scroll/Load
+    more loop). Capped at MAX_PAGES iterations.
+    """
     all_paths = set()
     url = LISTING_URL
 
@@ -140,6 +163,9 @@ def collect_brand_urls(session):
         added = len(new_paths - all_paths)
         all_paths |= new_paths
         _log(f"  found {len(new_paths)} brand links on this page ({added} new, {len(all_paths)} total)")
+
+        if page_num > 1 and added == 0:
+            break
 
         next_url = _find_next_url(soup, resp.url)
         if not next_url or next_url == url:
