@@ -164,8 +164,22 @@ def main():
     today = datetime.date.today().isoformat()
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        page = browser.new_page()
+        # Climate Active's CDN resets HTTP/2 connections coming from headless
+        # Chromium (net::ERR_HTTP2_PROTOCOL_ERROR). Forcing HTTP/1.1 and using a
+        # real-browser user agent keeps the session alive.
+        browser = p.chromium.launch(
+            headless=True,
+            args=["--disable-http2"],
+        )
+        context = browser.new_context(
+            user_agent=(
+                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+            ),
+            locale="en-AU",
+            viewport={"width": 1400, "height": 900},
+        )
+        page = context.new_page()
 
         print("Loading directory page...")
         brand_paths = collect_brand_urls(page)
