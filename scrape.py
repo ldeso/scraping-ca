@@ -24,6 +24,10 @@ OUTPUT_FILE = "companies.csv"
 IMPERSONATE = "chrome"
 REQUEST_TIMEOUT = 60
 RETRY_DELAYS = (2, 4, 8, 16)
+# Polite gap between brand-page requests. The CDN will silently start
+# rejecting HTTP/2 streams on a connection once it sees too many rapid
+# requests; this slows us down enough to stay under that threshold.
+BRAND_REQUEST_DELAY = 0.5
 
 SOCIAL_MEDIA_DOMAINS = [
     "facebook.com",
@@ -65,15 +69,52 @@ def _dump_failure(resp, context):
     _log(f"  body[:2k] : {snippet}")
 
 
-def fetch(session, url, *, context):
+def _new_session():
+    """Create a fresh curl_cffi session primed against the landing page."""
+    session = cc_requests.Session(impersonate=IMPERSONATE)
+    _log(f"Priming session against {BASE_URL} (impersonate={IMPERSONATE})...")
+    try:
+        prime = session.get(BASE_URL, timeout=REQUEST_TIMEOUT, allow_redirects=True)
+        _log(f"  prime: {_summarise_response(prime)}")
+    except Exception as e:
+        _log(f"  prime failed (continuing anyway): {e!r}")
+    return session
+
+
+class SessionHolder:
+    """Owns the curl_cffi session so `fetch` can swap it on connection failure.
+
+    Once the CDN returns a stream-level HTTP/2 error (curl code 92, INTERNAL_ERROR)
+    every later request on the same connection fails the same way — retries
+    against the live session can't recover. Replacing the session forces a new
+    TLS handshake and a fresh HTTP/2 connection.
+    """
+
+    def __init__(self):
+        self.session = _new_session()
+
+    def reset(self):
+        try:
+            self.session.close()
+        except Exception:
+            pass
+        self.session = _new_session()
+
+
+def fetch(holder, url, *, context):
     """GET a URL with retries; log diagnostics on every failure."""
     last_exc = None
     for attempt in range(len(RETRY_DELAYS) + 1):
         try:
-            resp = session.get(url, timeout=REQUEST_TIMEOUT, allow_redirects=True)
+            resp = holder.session.get(
+                url, timeout=REQUEST_TIMEOUT, allow_redirects=True
+            )
         except Exception as e:
             last_exc = e
             _log(f"  exception [{context}] attempt {attempt + 1}: {e!r}")
+            # Connection-level failure (e.g. curl 92 HTTP/2 INTERNAL_ERROR) —
+            # the HTTP/2 connection is poisoned; rebuild before retrying.
+            holder.reset()
         else:
             if resp.status_code == 200:
                 if attempt > 0:
@@ -90,7 +131,7 @@ def fetch(session, url, *, context):
     raise RuntimeError(f"GET {url} failed after retries: {last_exc!r}")
 
 
-def collect_brand_urls(session):
+def collect_brand_urls(holder):
     """Fetch the directory page and extract brand paths from its JSON payload.
 
     The listing page renders its cards client-side from a JSON blob on
@@ -98,7 +139,7 @@ def collect_brand_urls(session):
     per-brand anchors, so we parse that JSON directly.
     """
     _log(f"Fetching directory page: {LISTING_URL}")
-    resp = fetch(session, LISTING_URL, context="directory page")
+    resp = fetch(holder, LISTING_URL, context="directory page")
     soup = BeautifulSoup(resp.text, "html.parser")
 
     container = soup.select_one("div.certified-brands-list[data-model]")
@@ -133,9 +174,9 @@ def _is_external(href):
     return not any(domain in href for domain in SOCIAL_MEDIA_DOMAINS)
 
 
-def scrape_brand_page(session, brand_path):
+def scrape_brand_page(holder, brand_path):
     url = f"{BASE_URL}{brand_path}"
-    resp = fetch(session, url, context=f"brand {brand_path}")
+    resp = fetch(holder, url, context=f"brand {brand_path}")
     soup = BeautifulSoup(resp.text, "html.parser")
 
     h1 = soup.find("h1")
@@ -175,18 +216,10 @@ def load_existing_dates(filepath):
 def main():
     today = datetime.date.today().isoformat()
 
-    session = cc_requests.Session(impersonate=IMPERSONATE)
-    # Prime cookies (some Akamai deployments hand out a session cookie on the
-    # landing page that they then check on subsequent requests).
-    _log(f"Priming session against {BASE_URL} (impersonate={IMPERSONATE})...")
-    try:
-        prime = session.get(BASE_URL, timeout=REQUEST_TIMEOUT, allow_redirects=True)
-        _log(f"  prime: {_summarise_response(prime)}")
-    except Exception as e:
-        _log(f"  prime failed (continuing anyway): {e!r}")
+    holder = SessionHolder()
 
     _log("Loading directory page...")
-    brand_paths = collect_brand_urls(session)
+    brand_paths = collect_brand_urls(holder)
     _log(f"Found {len(brand_paths)} certified brands")
 
     if not brand_paths:
@@ -195,10 +228,12 @@ def main():
 
     companies = []
     for i, brand_path in enumerate(brand_paths, 1):
+        if i > 1:
+            time.sleep(BRAND_REQUEST_DELAY)
         slug = brand_path.rsplit("/", 1)[-1]
         _log(f"[{i}/{len(brand_paths)}] {slug}")
         try:
-            name, website = scrape_brand_page(session, brand_path)
+            name, website = scrape_brand_page(holder, brand_path)
             if name:
                 companies.append(
                     {
